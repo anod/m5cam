@@ -13,8 +13,10 @@
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #endif
 
-// mDNS hostname — device will be reachable at http://m5cam.local
+// mDNS hostname — device will be reachable at http://<name>.local
+#ifndef MDNS_HOSTNAME
 #define MDNS_HOSTNAME "m5cam"
+#endif
 
 // Camera settings
 #define CAMERA_FRAME_SIZE   FRAMESIZE_VGA   // 640x480 (good balance for streaming)
