@@ -45,7 +45,10 @@ MDNS_HOSTNAME=m5cam
 #### PlatformIO
 
 ```bash
-pio run -t upload
+pio run -t upload          # build and upload
+pio run                    # build only
+pio run -t clean           # clean build artifacts
+pio run -t clean && pio run -t upload  # clean build + upload
 ```
 
 ### 3. Verify
