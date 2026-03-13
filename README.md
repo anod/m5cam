@@ -15,12 +15,14 @@ Camera firmware for the [M5Stack Unit CamS3-5MP](https://docs.m5stack.com/en/uni
 
 ### 1. Configure WiFi
 
-Edit `include/config.h` and set your WiFi credentials:
+Create a `.env` file in the project root:
 
-```c
-#define WIFI_SSID     "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 ```
+WIFI_SSID=MyNetwork
+WIFI_PASSWORD=MyPassword
+```
+
+> This file is gitignored and never committed. Values are injected at build time via `load_env.py`.
 
 ### 2. Build & Upload
 

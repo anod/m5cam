@@ -23,5 +23,5 @@
 .DS_Store
 Thumbs.db
 
-# Credentials — never commit your real config!
-# include/config.h is tracked as a template with placeholder values.
+# Credentials
+.env

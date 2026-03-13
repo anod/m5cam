@@ -5,9 +5,13 @@
 
 #pragma once
 
-// Wi-Fi credentials
+// Wi-Fi credentials (override via .env file — see README)
+#ifndef WIFI_SSID
 #define WIFI_SSID     "YOUR_WIFI_SSID"
+#endif
+#ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
 
 // mDNS hostname — device will be reachable at http://m5cam.local
 #define MDNS_HOSTNAME "m5cam"
