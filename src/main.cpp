@@ -124,7 +124,12 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 void setup() {
     Serial.begin(115200);
     Serial.setDebugOutput(true);
+    // Wait for USB CDC connection (up to 5 seconds)
+    unsigned long start = millis();
+    while (!Serial && (millis() - start < 5000)) delay(10);
+    delay(500);
     Serial.println();
+    Serial.println("=== BOOT START ===");
 
     // LED indicator
     pinMode(LED_GPIO_NUM, OUTPUT);
@@ -154,19 +159,60 @@ void setup() {
     config.frame_size   = CAMERA_FRAME_SIZE;
     config.pixel_format = PIXFORMAT_JPEG;
     config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-    config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.jpeg_quality = CAMERA_JPEG_QUALITY;
     config.fb_count     = CAMERA_FB_COUNT;
 
+    // Use PSRAM if available, fall back to DRAM
+    if (ESP.getPsramSize() > 0) {
+        config.fb_location = CAMERA_FB_IN_PSRAM;
+        Serial.printf("Using PSRAM for frame buffers (available: %u bytes)\n",
+                      ESP.getFreePsram());
+    } else {
+        config.fb_location = CAMERA_FB_IN_DRAM;
+        Serial.println("WARNING: No PSRAM detected, using DRAM");
+    }
+
+    Serial.println("Calling esp_camera_init...");
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
         Serial.printf("Camera init failed: 0x%x\n", err);
-        // Blink LED rapidly to indicate error
         for (;;) {
             led_on(); delay(100); led_off(); delay(100);
         }
     }
     Serial.println("Camera initialized");
+
+    // Log sensor info
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor) {
+        Serial.printf("Sensor PID: 0x%04X\n", sensor->id.PID);
+        Serial.printf("Sensor MIDH: 0x%02X  MIDL: 0x%02X\n",
+                       sensor->id.MIDH, sensor->id.MIDL);
+    }
+
+    // Log memory
+    Serial.printf("PSRAM size: %u  Free PSRAM: %u\n",
+                  ESP.getPsramSize(), ESP.getFreePsram());
+    Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
+
+    // Warm-up delay — some sensors need time to stabilize
+    Serial.println("Camera warm-up...");
+    delay(2000);
+
+    // Test capture
+    Serial.println("Test capture...");
+    for (int i = 0; i < 5; i++) {
+        camera_fb_t *test_fb = esp_camera_fb_get();
+        if (test_fb) {
+            Serial.printf("Test frame %d OK: %u bytes, %dx%d, fmt=%d\n",
+                          i, test_fb->len, test_fb->width, test_fb->height,
+                          test_fb->format);
+            esp_camera_fb_return(test_fb);
+        } else {
+            Serial.printf("Test frame %d FAILED\n", i);
+            delay(1000);
+        }
+    }
 
     // ---- WiFi ----
     WiFi.mode(WIFI_STA);
@@ -197,7 +243,7 @@ void setup() {
     httpd_config_t httpd_config = HTTPD_DEFAULT_CONFIG();
     httpd_config.server_port    = HTTP_PORT;
     httpd_config.max_uri_handlers = 8;
-    httpd_config.stack_size     = 8192;
+    httpd_config.stack_size     = 16384;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &httpd_config) == ESP_OK) {
@@ -269,9 +315,12 @@ static esp_err_t index_handler(httpd_req_t *req) {
 static esp_err_t capture_handler(httpd_req_t *req) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-        Serial.println("Capture failed");
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
+        Serial.println("Capture failed — fb_get returned NULL");
+        const char *err_msg = "{\"error\":\"Camera frame buffer is NULL. "
+            "The sensor may not be producing frames.\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, err_msg, strlen(err_msg));
     }
 
     httpd_resp_set_type(req, "image/jpeg");
@@ -352,19 +401,22 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 //  Handler: /status  (JSON device info)
 // ============================================================
 static esp_err_t status_handler(httpd_req_t *req) {
-    char json[512];
+    char json[768];
     sensor_t *s = esp_camera_sensor_get();
     String ip = WiFi.localIP().toString();
 
     snprintf(json, sizeof(json),
         "{"
         "\"device\":\"M5Stack Unit CamS3-5MP\","
-        "\"sensor_pid\":\"0x%02X\","
+        "\"sensor_pid\":\"0x%04X\","
+        "\"sensor_midh\":\"0x%02X\","
+        "\"sensor_midl\":\"0x%02X\","
         "\"ip\":\"%s\","
         "\"hostname\":\"%s.local\","
         "\"rssi\":%d,"
         "\"uptime_sec\":%lu,"
         "\"free_heap\":%u,"
+        "\"psram_size\":%u,"
         "\"free_psram\":%u,"
         "\"framesize\":%d,"
         "\"quality\":%d,"
@@ -372,11 +424,14 @@ static esp_err_t status_handler(httpd_req_t *req) {
         "\"capture_url\":\"http://%s/capture\""
         "}",
         s ? s->id.PID : 0,
+        s ? s->id.MIDH : 0,
+        s ? s->id.MIDL : 0,
         ip.c_str(),
         MDNS_HOSTNAME,
         WiFi.RSSI(),
         (unsigned long)(esp_timer_get_time() / 1000000),
         ESP.getFreeHeap(),
+        ESP.getPsramSize(),
         ESP.getFreePsram(),
         s ? s->status.framesize : -1,
         s ? s->status.quality : -1,
