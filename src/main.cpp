@@ -30,6 +30,15 @@ static esp_err_t capture_handler(httpd_req_t *req);
 static esp_err_t stream_handler(httpd_req_t *req);
 static esp_err_t status_handler(httpd_req_t *req);
 
+// SCCB (I2C) register access — from pre-compiled esp32-camera library.
+// Used to manually configure PY260 sensor after esp_camera_init(), since the
+// pre-compiled mega_ccm driver's set_pixformat() doesn't apply a proper reset
+// sequence, leaving the sensor stuck in raw YUV422 mode instead of JPEG.
+extern "C" {
+    uint8_t SCCB_Read16(uint8_t slv_addr, uint16_t reg);
+    int SCCB_Write16(uint8_t slv_addr, uint16_t reg, uint8_t data);
+}
+
 // ---- MJPEG stream boundary ----
 #define PART_BOUNDARY "frame"
 static const char *STREAM_CONTENT_TYPE =
@@ -124,12 +133,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 void setup() {
     Serial.begin(115200);
     Serial.setDebugOutput(true);
-    // Wait for USB CDC connection (up to 5 seconds)
     unsigned long start = millis();
     while (!Serial && (millis() - start < 5000)) delay(10);
     delay(500);
-    Serial.println();
-    Serial.println("=== BOOT START ===");
+    Serial.println("\n=== M5 CamS3-5MP Boot ===");
 
     // LED indicator
     pinMode(LED_GPIO_NUM, OUTPUT);
@@ -182,37 +189,45 @@ void setup() {
     }
     Serial.println("Camera initialized");
 
-    // Log sensor info
+    // PY260 SCCB workaround: the pre-compiled mega_ccm driver doesn't include
+    // a proper delay in its reset sequence, so the sensor stays in raw YUV422
+    // mode. We perform a manual reset with correct timing, then re-configure
+    // pixel format, resolution, and quality via direct SCCB register writes.
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor) {
         Serial.printf("Sensor PID: 0x%04X\n", sensor->id.PID);
-        Serial.printf("Sensor MIDH: 0x%02X  MIDL: 0x%02X\n",
-                       sensor->id.MIDH, sensor->id.MIDL);
-    }
 
-    // Log memory
-    Serial.printf("PSRAM size: %u  Free PSRAM: %u\n",
-                  ESP.getPsramSize(), ESP.getFreePsram());
-    Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
+        // Reset with 100ms hold + 1500ms settle (matches M5Stack reference)
+        SCCB_Write16(sensor->slv_addr, 0x0102, 0x00);
+        delay(100);
+        SCCB_Write16(sensor->slv_addr, 0x0102, 0x01);
+        delay(1500);
 
-    // Warm-up delay — some sensors need time to stabilize
-    Serial.println("Camera warm-up...");
-    delay(2000);
+        // PY260 register map: 0x0120=pixel_fmt, 0x0121=resolution, 0x012A=quality
+        SCCB_Write16(sensor->slv_addr, 0x0120, 0x01);  // JPEG
+        delay(100);
 
-    // Test capture
-    Serial.println("Test capture...");
-    for (int i = 0; i < 5; i++) {
-        camera_fb_t *test_fb = esp_camera_fb_get();
-        if (test_fb) {
-            Serial.printf("Test frame %d OK: %u bytes, %dx%d, fmt=%d\n",
-                          i, test_fb->len, test_fb->width, test_fb->height,
-                          test_fb->format);
-            esp_camera_fb_return(test_fb);
-        } else {
-            Serial.printf("Test frame %d FAILED\n", i);
-            delay(1000);
+        // Resolution values: 0x01=QVGA, 0x02=VGA, 0x03=HD, 0x04=FHD
+        uint8_t res_reg;
+        switch (CAMERA_FRAME_SIZE) {
+            case FRAMESIZE_QVGA: res_reg = 0x01; break;
+            case FRAMESIZE_VGA:  res_reg = 0x02; break;
+            case FRAMESIZE_HD:   res_reg = 0x03; break;
+            case FRAMESIZE_FHD:  res_reg = 0x04; break;
+            default:             res_reg = 0x02; break;  // Default VGA
         }
+        SCCB_Write16(sensor->slv_addr, 0x0121, res_reg);
+        delay(100);
+
+        // Quality: 0=high, 1=default, 2=low
+        SCCB_Write16(sensor->slv_addr, 0x012A, 0x00);  // High quality
+        delay(100);
+
+        Serial.println("PY260 configured via SCCB");
     }
+
+    // Wait for sensor to stabilize
+    delay(2000);
 
     // ---- WiFi ----
     WiFi.mode(WIFI_STA);
@@ -386,7 +401,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         int64_t now = esp_timer_get_time();
         int64_t frame_time = (now - last_frame) / 1000;
         last_frame = now;
-        Serial.printf("MJPG: %4luKB %3lums (%.1f fps)\r\n",
+        Serial.printf("MJPG: %4luKB %3lums (%.1f fps)\r",
                       (unsigned long)(frame_len / 1024),
                       (unsigned long)frame_time,
                       frame_time > 0 ? 1000.0 / frame_time : 0.0);

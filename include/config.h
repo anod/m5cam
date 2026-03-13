@@ -19,9 +19,9 @@
 #endif
 
 // Camera settings
-#define CAMERA_FRAME_SIZE   FRAMESIZE_QVGA  // 320x240 (debugging — start small)
-#define CAMERA_JPEG_QUALITY 20              // 0-63, lower = better quality, more bandwidth
-#define CAMERA_FB_COUNT     1               // Frame buffer count
+#define CAMERA_FRAME_SIZE   FRAMESIZE_VGA   // 640x480
+#define CAMERA_JPEG_QUALITY 12              // 0-63, lower = better quality, more bandwidth
+#define CAMERA_FB_COUNT     2               // Double-buffered for smooth streaming
 #define CAMERA_XCLK_FREQ    20000000        // 20 MHz
 
 // Web server port

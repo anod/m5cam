@@ -116,6 +116,27 @@ camera_view: live
 ## Hardware Notes
 
 - **Camera sensor:** PY260 (OV5640-compatible), 5MP, fixed focus (0.6m)
-- **Two hardware versions** exist — see [M5Stack docs](https://docs.m5stack.com/en/arduino/m5unitcams3_5mp/program) to detect yours
-- Old hardware version needs a patched `esp32-camera` library (see M5Stack docs)
-- LED on GPIO 14 indicates streaming status
+- **MCU:** ESP32-S3 with 16MB flash + 8MB OPI PSRAM
+- **LED** on GPIO 14 indicates streaming status
+
+## Technical Details
+
+### PY260 JPEG Workaround
+
+The pre-compiled `esp32-camera` library's mega_ccm driver doesn't include proper
+timing in the PY260 reset sequence, causing the sensor to stay in raw YUV422 mode
+instead of JPEG. This firmware works around the issue by:
+
+1. **Manual SCCB reset** — After `esp_camera_init()`, we reset the PY260 via direct
+   SCCB (I2C) register writes with a 100ms hold + 1500ms settle delay (matching
+   the M5Stack reference implementation)
+2. **Direct register configuration** — Pixel format (JPEG), resolution, and quality
+   are set via SCCB register writes to bypass the non-functional driver functions
+3. **Patched `cam_hal.c`** — A modified version of the esp32-camera DMA layer with
+   a larger JPEG receive buffer (512KB vs the default formula) to handle PY260's
+   variable-size JPEG output
+
+### Custom Board Definition
+
+`boards/m5stack-unitcams3.json` defines the correct hardware configuration
+(16MB flash, OPI PSRAM) since the stock PlatformIO board definitions use 8MB flash.
