@@ -21,9 +21,27 @@
 #include <ESPmDNS.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include "esp_task_wdt.h"
 
 #include "config.h"
 #include "camera_pins.h"
+
+// ---- Stability defaults (override in config.h) ----
+#ifndef WIFI_RECONNECT_INTERVAL_MS
+#define WIFI_RECONNECT_INTERVAL_MS 30000   // check WiFi every 30s
+#endif
+#ifndef CAMERA_HEALTH_INTERVAL_MS
+#define CAMERA_HEALTH_INTERVAL_MS  60000   // test-grab every 60s
+#endif
+#ifndef CAMERA_MAX_FAILURES
+#define CAMERA_MAX_FAILURES        5       // consecutive failures before reboot
+#endif
+#ifndef WDT_TIMEOUT_SEC
+#define WDT_TIMEOUT_SEC            30      // watchdog timeout
+#endif
+#ifndef STREAM_MAX_FRAME_FAILURES
+#define STREAM_MAX_FRAME_FAILURES  3       // transient failures before ending stream
+#endif
 
 // ---- Forward declarations ----
 static esp_err_t index_handler(httpd_req_t *req);
@@ -52,6 +70,37 @@ static const char *STREAM_PART =
 // ---- LED helpers ----
 static void led_on()  { digitalWrite(LED_GPIO_NUM, HIGH); }
 static void led_off() { digitalWrite(LED_GPIO_NUM, LOW); }
+
+// ---- Stability state ----
+static unsigned long last_wifi_check = 0;
+static unsigned long last_health_check = 0;
+static int camera_fail_count = 0;
+
+static void wifi_reconnect() {
+    if (WiFi.status() == WL_CONNECTED) return;
+
+    Serial.println("WiFi lost — reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 40) {
+        delay(500);
+        retries++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("WiFi reconnected! IP: %s\n", WiFi.localIP().toString().c_str());
+        // Restore mDNS after reconnect
+        MDNS.end();
+        if (MDNS.begin(MDNS_HOSTNAME)) {
+            MDNS.addService("http", "tcp", HTTP_PORT);
+            Serial.printf("mDNS restored: http://%s.local\n", MDNS_HOSTNAME);
+        }
+    } else {
+        Serial.println("WiFi reconnect failed — will retry next cycle");
+    }
+}
 
 // ---- HTML page ----
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -309,6 +358,16 @@ void setup() {
     // Ready — brief LED flash
     led_on(); delay(200); led_off();
 
+    // ---- Watchdog ----
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WDT_TIMEOUT_SEC * 1000,
+        .idle_core_mask = 0,
+        .trigger_panic = true,
+    };
+    esp_task_wdt_reconfigure(&wdt_config);
+    esp_task_wdt_add(NULL);  // subscribe Arduino loop task
+    Serial.printf("Watchdog enabled (%ds timeout)\n", WDT_TIMEOUT_SEC);
+
     Serial.println("========================================");
     Serial.printf("  M5 CamS3-5MP Ready!\n");
     Serial.printf("  http://%s\n", WiFi.localIP().toString().c_str());
@@ -317,10 +376,38 @@ void setup() {
 }
 
 // ============================================================
-//  Loop — nothing needed; HTTP server runs on its own task
+//  Loop — WiFi reconnection + camera health monitoring
 // ============================================================
 void loop() {
-    delay(10000);
+    esp_task_wdt_reset();
+    unsigned long now = millis();
+
+    // WiFi reconnection
+    if (now - last_wifi_check >= WIFI_RECONNECT_INTERVAL_MS) {
+        last_wifi_check = now;
+        wifi_reconnect();
+    }
+
+    // Camera health: grab a test frame to detect sensor hangs
+    if (now - last_health_check >= CAMERA_HEALTH_INTERVAL_MS) {
+        last_health_check = now;
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            esp_camera_fb_return(fb);
+            camera_fail_count = 0;
+        } else {
+            camera_fail_count++;
+            Serial.printf("Camera health: frame grab failed (%d/%d)\n",
+                          camera_fail_count, CAMERA_MAX_FAILURES);
+            if (camera_fail_count >= CAMERA_MAX_FAILURES) {
+                Serial.println("Camera unresponsive — rebooting!");
+                delay(100);
+                ESP.restart();
+            }
+        }
+    }
+
+    delay(1000);
 }
 
 // ============================================================
@@ -328,18 +415,12 @@ void loop() {
 // ============================================================
 static esp_err_t index_handler(httpd_req_t *req) {
     String ip = WiFi.localIP().toString();
-    // INDEX_HTML has two %s placeholders for the IP address
-    size_t html_len = strlen_P(INDEX_HTML) + ip.length() * 2 + 1;
-    char *html = (char *)malloc(html_len);
-    if (!html) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    snprintf(html, html_len, INDEX_HTML, ip.c_str(), ip.c_str());
+    // Stack buffer — INDEX_HTML renders to ~3.5KB after IP substitution
+    char html[4096];
+    snprintf(html, sizeof(html), INDEX_HTML, ip.c_str(), ip.c_str());
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_send(req, html, strlen(html));
-    free(html);
     return ESP_OK;
 }
 
@@ -384,14 +465,22 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     Serial.println("Stream started");
 
     int64_t last_frame = esp_timer_get_time();
+    int frame_failures = 0;
 
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
-            Serial.println("Stream: frame capture failed");
-            res = ESP_FAIL;
-            break;
+            frame_failures++;
+            Serial.printf("Stream: frame grab failed (%d/%d)\n",
+                          frame_failures, STREAM_MAX_FRAME_FAILURES);
+            if (frame_failures >= STREAM_MAX_FRAME_FAILURES) {
+                res = ESP_FAIL;
+                break;
+            }
+            delay(100);
+            continue;
         }
+        frame_failures = 0;
 
         // Send MJPEG boundary
         res = httpd_resp_send_chunk(req, STREAM_BOUNDARY,
