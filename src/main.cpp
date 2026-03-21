@@ -6,6 +6,7 @@
  *   /capture  — Single JPEG snapshot
  *   /stream   — MJPEG stream (for Home Assistant)
  *   /status   — JSON device status
+ *   /restart  — Reboot the device
  *
  * Home Assistant configuration.yaml:
  *   camera:
@@ -29,6 +30,7 @@ static esp_err_t index_handler(httpd_req_t *req);
 static esp_err_t capture_handler(httpd_req_t *req);
 static esp_err_t stream_handler(httpd_req_t *req);
 static esp_err_t status_handler(httpd_req_t *req);
+static esp_err_t restart_handler(httpd_req_t *req);
 
 // SCCB (I2C) register access — from pre-compiled esp32-camera library.
 // Used to manually configure PY260 sensor after esp_camera_init(), since the
@@ -74,6 +76,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .btn-stream:hover{background:#00b8d9}
     .btn-capture{background:#ff6b6b;color:#fff}
     .btn-capture:hover{background:#ee5a5a}
+    .btn-restart{background:#ff9f43;color:#1a1a2e}
+    .btn-restart:hover{background:#e08b30}
     .info{margin-top:1rem;padding:1rem;background:#16213e;border-radius:8px;
           font-size:0.8rem;line-height:1.6;max-width:640px;width:100%%}
     .info code{background:#0f3460;padding:0.15rem 0.4rem;border-radius:3px;font-size:0.85em}
@@ -88,12 +92,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="controls">
     <button class="btn-stream" onclick="toggleStream()">Start Stream</button>
     <button class="btn-capture" onclick="captureStill()">📸 Snapshot</button>
+    <button class="btn-restart" onclick="restartDevice()">🔄 Restart</button>
   </div>
   <div class="info">
     <strong>Endpoints:</strong><br>
     Stream: <code><a href="/stream">/stream</a></code> &nbsp;
     Snapshot: <code><a href="/capture">/capture</a></code> &nbsp;
-    Status: <code><a href="/status">/status</a></code><br><br>
+    Status: <code><a href="/status">/status</a></code> &nbsp;
+    Restart: <code><a href="/restart">/restart</a></code><br><br>
     <strong>Home Assistant (configuration.yaml):</strong><br>
     <code>camera:</code><br>
     <code>&nbsp;&nbsp;- platform: mjpeg</code><br>
@@ -122,6 +128,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     img.src = '/capture?' + Date.now();
     streaming = false;
     btn.textContent = 'Start Stream';
+  }
+  function restartDevice() {
+    if (!confirm('Restart the camera?')) return;
+    fetch('/restart').then(() => {
+      document.body.innerHTML = '<h1 style="color:#ff9f43;margin:2rem">Restarting…</h1>' +
+        '<p style="color:#e0e0e0">Reloading in 10 seconds.</p>';
+      setTimeout(() => location.reload(), 10000);
+    });
   }
 </script>
 </html>
@@ -278,10 +292,15 @@ void setup() {
             .uri = "/status", .method = HTTP_GET,
             .handler = status_handler, .user_ctx = NULL
         };
+        httpd_uri_t restart_uri = {
+            .uri = "/restart", .method = HTTP_GET,
+            .handler = restart_handler, .user_ctx = NULL
+        };
         httpd_register_uri_handler(server, &index_uri);
         httpd_register_uri_handler(server, &capture_uri);
         httpd_register_uri_handler(server, &stream_uri);
         httpd_register_uri_handler(server, &status_uri);
+        httpd_register_uri_handler(server, &restart_uri);
         Serial.println("HTTP server started");
     } else {
         Serial.println("HTTP server failed to start!");
@@ -457,4 +476,18 @@ static esp_err_t status_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, json, strlen(json));
+}
+
+// ============================================================
+//  Handler: /restart  (Reboot device)
+// ============================================================
+static esp_err_t restart_handler(httpd_req_t *req) {
+    Serial.println("Restart requested via /restart");
+    const char *resp = "{\"message\":\"Restarting...\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, resp, strlen(resp));
+    delay(500);
+    ESP.restart();
+    return ESP_OK;
 }

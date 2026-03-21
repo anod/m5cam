@@ -8,6 +8,7 @@ Firmware for the [M5Stack Unit CamS3-5MP](https://docs.m5stack.com/en/unit/Unit-
 | `/capture` | Single JPEG snapshot     |
 | `/stream`  | MJPEG video stream       |
 | `/status`  | JSON device info         |
+| `/restart` | Reboot the device        |
 
 ## Quick Start
 
