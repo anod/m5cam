@@ -43,12 +43,17 @@
 #define STREAM_MAX_FRAME_FAILURES  3       // transient failures before ending stream
 #endif
 
-// ---- Forward declarations ----
+// ---- Forward declarations: HTTP handlers ----
 static esp_err_t index_handler(httpd_req_t *req);
 static esp_err_t capture_handler(httpd_req_t *req);
 static esp_err_t stream_handler(httpd_req_t *req);
 static esp_err_t status_handler(httpd_req_t *req);
 static esp_err_t restart_handler(httpd_req_t *req);
+
+// ---- Forward declarations: setup helpers ----
+static void setup_camera();
+static void setup_wifi();
+static void setup_http_server();
 
 // SCCB (I2C) register access — from pre-compiled esp32-camera library.
 // Used to manually configure PY260 sensor after esp_camera_init(), since the
@@ -61,10 +66,10 @@ extern "C" {
 
 // ---- MJPEG stream boundary ----
 #define PART_BOUNDARY "frame"
-static const char *STREAM_CONTENT_TYPE =
+static const char *const STREAM_CONTENT_TYPE =
     "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char *STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char *STREAM_PART =
+static const char *const STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *const STREAM_PART =
     "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 // ---- LED helpers ----
@@ -90,7 +95,9 @@ static void wifi_reconnect() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("WiFi reconnected! IP: %s\n", WiFi.localIP().toString().c_str());
+        char ip[16];
+        WiFi.localIP().toString().toCharArray(ip, sizeof(ip));
+        Serial.printf("WiFi reconnected! IP: %s\n", ip);
         // Restore mDNS after reconnect
         MDNS.end();
         if (MDNS.begin(MDNS_HOSTNAME)) {
@@ -191,22 +198,97 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 // ============================================================
-//  Setup
+//  Camera initialisation
 // ============================================================
-void setup() {
-    Serial.begin(115200);
-    Serial.setDebugOutput(true);
-    unsigned long start = millis();
-    while (!Serial && (millis() - start < 5000)) delay(10);
-    delay(500);
-    Serial.println("\n=== M5 CamS3-5MP Boot ===");
 
-    // LED indicator
-    pinMode(LED_GPIO_NUM, OUTPUT);
-    led_off();
+// Apply a single sensor setting and log whether the driver accepted it.
+// Uses a typedef matching the common sensor_t setter signature.
+typedef int (*sensor_set_fn_t)(sensor_t *, int);
 
-    // ---- Camera init ----
-    camera_config_t config;
+static bool apply_sensor_setting(sensor_t *s, const char *name,
+                                 sensor_set_fn_t fn, int value) {
+    if (!fn) {
+        Serial.printf("  %-18s SKIPPED (not implemented)\n", name);
+        return false;
+    }
+    int rc = fn(s, value);
+    Serial.printf("  %-18s %s (value=%d)\n", name, rc == 0 ? "OK" : "FAILED", value);
+    return rc == 0;
+}
+
+// PY260 SCCB workaround: the pre-compiled mega_ccm driver doesn't include
+// a proper delay in its reset sequence, so the sensor stays in raw YUV422
+// mode. We perform a manual reset with correct timing, then re-configure
+// pixel format, resolution, and quality via direct SCCB register writes.
+static void py260_sccb_configure(sensor_t *sensor) {
+    Serial.printf("Sensor PID: 0x%04X\n", sensor->id.PID);
+
+    // Reset with 100ms hold + 1500ms settle (matches M5Stack reference)
+    SCCB_Write16(sensor->slv_addr, 0x0102, 0x00);
+    delay(100);
+    SCCB_Write16(sensor->slv_addr, 0x0102, 0x01);
+    delay(1500);
+
+    // PY260 register map: 0x0120=pixel_fmt, 0x0121=resolution, 0x012A=quality
+    SCCB_Write16(sensor->slv_addr, 0x0120, 0x01);  // JPEG
+    delay(100);
+
+    // Resolution values: 0x01=QVGA, 0x02=VGA, 0x03=HD, 0x04=FHD
+    uint8_t res_reg;
+    switch (CAMERA_FRAME_SIZE) {
+        case FRAMESIZE_QVGA: res_reg = 0x01; break;
+        case FRAMESIZE_VGA:  res_reg = 0x02; break;
+        case FRAMESIZE_HD:   res_reg = 0x03; break;
+        case FRAMESIZE_FHD:  res_reg = 0x04; break;
+        default:             res_reg = 0x02; break;  // Default VGA
+    }
+    SCCB_Write16(sensor->slv_addr, 0x0121, res_reg);
+    delay(100);
+
+    // Quality: 0=high, 1=default, 2=low
+    SCCB_Write16(sensor->slv_addr, 0x012A, 0x00);  // High quality
+    delay(100);
+
+    Serial.println("PY260 configured via SCCB");
+}
+
+// Re-enable ISP features after manual reset — without this the sensor's
+// image processing pipeline may be left unconfigured, causing red cast and
+// excessive noise in low-light scenes.
+static void configure_isp(sensor_t *s) {
+    Serial.println("Configuring ISP features:");
+
+    // White balance
+    apply_sensor_setting(s, "AWB",            s->set_whitebal,      1);
+    apply_sensor_setting(s, "AWB gain",       s->set_awb_gain,      1);
+    apply_sensor_setting(s, "WB mode (auto)", s->set_wb_mode,       0);
+
+    // Exposure & gain
+    apply_sensor_setting(s, "Auto exposure",  s->set_exposure_ctrl, 1);
+    apply_sensor_setting(s, "AEC2 (DSP)",     s->set_aec2,         1);
+    apply_sensor_setting(s, "Auto gain",      s->set_gain_ctrl,     1);
+
+    // set_gainceiling has a different signature (gainceiling_t enum) — call directly
+    if (s->set_gainceiling) {
+        int rc = s->set_gainceiling(s, static_cast<gainceiling_t>(2));
+        Serial.printf("  %-18s %s (value=%d)\n", "Gain ceiling",
+                      rc == 0 ? "OK" : "FAILED", 2);
+    } else {
+        Serial.printf("  %-18s SKIPPED (not implemented)\n", "Gain ceiling");
+    }
+
+    // Pixel / lens correction
+    apply_sensor_setting(s, "BPC",            s->set_bpc,           1);
+    apply_sensor_setting(s, "WPC",            s->set_wpc,           1);
+    apply_sensor_setting(s, "Gamma",          s->set_raw_gma,       1);
+    apply_sensor_setting(s, "Lens correction",s->set_lenc,          1);
+
+    // Noise reduction
+    apply_sensor_setting(s, "Denoise",        s->set_denoise,       0);
+}
+
+static void setup_camera() {
+    camera_config_t config = {};
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer   = LEDC_TIMER_0;
     config.pin_d0       = Y2_GPIO_NUM;
@@ -252,62 +334,20 @@ void setup() {
     }
     Serial.println("Camera initialized");
 
-    // PY260 SCCB workaround: the pre-compiled mega_ccm driver doesn't include
-    // a proper delay in its reset sequence, so the sensor stays in raw YUV422
-    // mode. We perform a manual reset with correct timing, then re-configure
-    // pixel format, resolution, and quality via direct SCCB register writes.
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor) {
-        Serial.printf("Sensor PID: 0x%04X\n", sensor->id.PID);
-
-        // Reset with 100ms hold + 1500ms settle (matches M5Stack reference)
-        SCCB_Write16(sensor->slv_addr, 0x0102, 0x00);
-        delay(100);
-        SCCB_Write16(sensor->slv_addr, 0x0102, 0x01);
-        delay(1500);
-
-        // PY260 register map: 0x0120=pixel_fmt, 0x0121=resolution, 0x012A=quality
-        SCCB_Write16(sensor->slv_addr, 0x0120, 0x01);  // JPEG
-        delay(100);
-
-        // Resolution values: 0x01=QVGA, 0x02=VGA, 0x03=HD, 0x04=FHD
-        uint8_t res_reg;
-        switch (CAMERA_FRAME_SIZE) {
-            case FRAMESIZE_QVGA: res_reg = 0x01; break;
-            case FRAMESIZE_VGA:  res_reg = 0x02; break;
-            case FRAMESIZE_HD:   res_reg = 0x03; break;
-            case FRAMESIZE_FHD:  res_reg = 0x04; break;
-            default:             res_reg = 0x02; break;  // Default VGA
-        }
-        SCCB_Write16(sensor->slv_addr, 0x0121, res_reg);
-        delay(100);
-
-        // Quality: 0=high, 1=default, 2=low
-        SCCB_Write16(sensor->slv_addr, 0x012A, 0x00);  // High quality
-        delay(100);
-
-        Serial.println("PY260 configured via SCCB");
-
-        // Re-enable auto white balance and exposure after manual reset —
-        // without this the sensor's AWB/AEC may be left in a default state,
-        // causing a strong red cast in low-light / indoor scenes.
-        if (sensor->set_whitebal)
-            sensor->set_whitebal(sensor, 1);     // enable AWB
-        if (sensor->set_awb_gain)
-            sensor->set_awb_gain(sensor, 1);     // enable AWB gain adjustment
-        if (sensor->set_wb_mode)
-            sensor->set_wb_mode(sensor, 0);      // 0 = Auto
-        if (sensor->set_exposure_ctrl)
-            sensor->set_exposure_ctrl(sensor, 1); // enable auto exposure
-        if (sensor->set_gain_ctrl)
-            sensor->set_gain_ctrl(sensor, 1);     // enable auto gain
-        Serial.println("AWB/AEC/AGC enabled");
+        py260_sccb_configure(sensor);
+        configure_isp(sensor);
     }
 
     // Wait for sensor to stabilize
     delay(2000);
+}
 
-    // ---- WiFi ----
+// ============================================================
+//  WiFi
+// ============================================================
+static void setup_wifi() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     WiFi.setSleep(false);  // Keep WiFi active for low-latency streaming
@@ -324,19 +364,24 @@ void setup() {
         }
     }
     led_off();
-    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+    char ip[16];
+    WiFi.localIP().toString().toCharArray(ip, sizeof(ip));
+    Serial.printf("\nConnected! IP: %s\n", ip);
 
-    // ---- mDNS ----
     if (MDNS.begin(MDNS_HOSTNAME)) {
         MDNS.addService("http", "tcp", HTTP_PORT);
         Serial.printf("mDNS: http://%s.local\n", MDNS_HOSTNAME);
     }
+}
 
-    // ---- HTTP Server ----
+// ============================================================
+//  HTTP Server
+// ============================================================
+static void setup_http_server() {
     httpd_config_t httpd_config = HTTPD_DEFAULT_CONFIG();
-    httpd_config.server_port    = HTTP_PORT;
+    httpd_config.server_port      = HTTP_PORT;
     httpd_config.max_uri_handlers = 8;
-    httpd_config.stack_size     = 16384;
+    httpd_config.stack_size       = 16384;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &httpd_config) == ESP_OK) {
@@ -369,6 +414,25 @@ void setup() {
     } else {
         Serial.println("HTTP server failed to start!");
     }
+}
+
+// ============================================================
+//  Setup
+// ============================================================
+void setup() {
+    Serial.begin(115200);
+    Serial.setDebugOutput(true);
+    unsigned long start = millis();
+    while (!Serial && (millis() - start < 5000)) delay(10);
+    delay(500);
+    Serial.println("\n=== M5 CamS3-5MP Boot ===");
+
+    pinMode(LED_GPIO_NUM, OUTPUT);
+    led_off();
+
+    setup_camera();
+    setup_wifi();
+    setup_http_server();
 
     // Ready — brief LED flash
     led_on(); delay(200); led_off();
@@ -385,7 +449,9 @@ void setup() {
 
     Serial.println("========================================");
     Serial.printf("  M5 CamS3-5MP Ready!\n");
-    Serial.printf("  http://%s\n", WiFi.localIP().toString().c_str());
+    char boot_ip[16];
+    WiFi.localIP().toString().toCharArray(boot_ip, sizeof(boot_ip));
+    Serial.printf("  http://%s\n", boot_ip);
     Serial.printf("  http://%s.local\n", MDNS_HOSTNAME);
     Serial.println("========================================");
 }
@@ -429,14 +495,22 @@ void loop() {
 //  Handler: /  (Web UI)
 // ============================================================
 static esp_err_t index_handler(httpd_req_t *req) {
-    String ip = WiFi.localIP().toString();
-    // Stack buffer — INDEX_HTML renders to ~3.5KB after IP substitution
-    char html[4096];
-    snprintf(html, sizeof(html), INDEX_HTML, ip.c_str(), ip.c_str());
+    // Render the template into a heap buffer (PSRAM-backed when available)
+    // to avoid consuming 25% of the HTTP task's 16KB stack.
+    char ip[16];
+    WiFi.localIP().toString().toCharArray(ip, sizeof(ip));
+    size_t needed = strlen_P(INDEX_HTML) + 128;  // template + IP substitutions
+    char *html = static_cast<char *>(malloc(needed));
+    if (!html) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "Out of memory", HTTPD_RESP_USE_STRLEN);
+    }
+    snprintf(html, needed, INDEX_HTML, ip, ip);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_send(req, html, strlen(html));
-    return ESP_OK;
+    esp_err_t res = httpd_resp_send(req, html, strlen(html));
+    free(html);
+    return res;
 }
 
 // ============================================================
@@ -541,9 +615,10 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 static esp_err_t status_handler(httpd_req_t *req) {
     char json[768];
     sensor_t *s = esp_camera_sensor_get();
-    String ip = WiFi.localIP().toString();
+    char ip[16];
+    WiFi.localIP().toString().toCharArray(ip, sizeof(ip));
 
-    snprintf(json, sizeof(json),
+    int written = snprintf(json, sizeof(json),
         "{"
         "\"device\":\"M5Stack Unit CamS3-5MP\","
         "\"sensor_pid\":\"0x%04X\","
@@ -564,7 +639,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
         s ? s->id.PID : 0,
         s ? s->id.MIDH : 0,
         s ? s->id.MIDL : 0,
-        ip.c_str(),
+        ip,
         MDNS_HOSTNAME,
         WiFi.RSSI(),
         (unsigned long)(esp_timer_get_time() / 1000000),
@@ -573,9 +648,13 @@ static esp_err_t status_handler(httpd_req_t *req) {
         ESP.getFreePsram(),
         s ? s->status.framesize : -1,
         s ? s->status.quality : -1,
-        ip.c_str(),
-        ip.c_str()
+        ip,
+        ip
     );
+
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(json)) {
+        Serial.println("WARNING: /status JSON truncated");
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
