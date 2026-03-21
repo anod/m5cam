@@ -201,90 +201,77 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 //  Camera initialisation
 // ============================================================
 
-// Apply a single sensor setting and log whether the driver accepted it.
-// Uses a typedef matching the common sensor_t setter signature.
-typedef int (*sensor_set_fn_t)(sensor_t *, int);
+// PY260 SCCB register addresses (from mega_ccm_regs.h).
+// The mega_ccm driver maps most sensor_t ISP setters to a no-op "set_dummy"
+// that always returns -1.  The only reliable way to configure this sensor
+// after a manual reset is via direct SCCB register writes.
+#define PY260_RESET_REG       0x0102
+#define PY260_PIXEL_FMT       0x0120  // 0x01=JPEG, 0x02=RGB565, 0x03=YUV422
+#define PY260_RESOLUTION      0x0121  // 0x01=QVGA … 0x06=5MP
+#define PY260_BRIGHTNESS      0x0122  // 0–8
+#define PY260_CONTRAST        0x0123  // 0–6
+#define PY260_SATURATION      0x0124  // 0–6
+#define PY260_EXP_COMPENSATE  0x0125
+#define PY260_AWB_MODE        0x0126  // 0=auto,1=sunny,2=cloudy,3=office,4=home
+#define PY260_SHARPNESS       0x0128  // sharpness level
+#define PY260_QUALITY         0x012A  // 0=high, 1=default, 2=low
+#define PY260_AGC_MODE        0x0130  // 0=auto, 1=manual
+#define PY260_SYS_CLK_DIV     0x0200
+#define PY260_SYS_PLL_DIV     0x0201
 
-static bool apply_sensor_setting(sensor_t *s, const char *name,
-                                 sensor_set_fn_t fn, int value) {
-    if (!fn) {
-        Serial.printf("  %-18s SKIPPED (not implemented)\n", name);
-        return false;
-    }
-    int rc = fn(s, value);
-    Serial.printf("  %-18s %s (value=%d)\n", name, rc == 0 ? "OK" : "FAILED", value);
-    return rc == 0;
+// Helper: write a PY260 register and log success/failure.
+static void py260_write(uint8_t slv, uint16_t reg, uint8_t val,
+                        const char *label) {
+    int rc = SCCB_Write16(slv, reg, val);
+    Serial.printf("  %-20s 0x%04X=0x%02X %s\n", label, reg, val,
+                  rc == 0 ? "OK" : "FAIL");
 }
 
 // PY260 SCCB workaround: the pre-compiled mega_ccm driver doesn't include
 // a proper delay in its reset sequence, so the sensor stays in raw YUV422
-// mode. We perform a manual reset with correct timing, then re-configure
-// pixel format, resolution, and quality via direct SCCB register writes.
+// mode.  We perform a manual reset with correct timing, then fully
+// re-configure format, resolution, clock, ISP, and quality via direct
+// SCCB register writes.  This replaces the sensor_t API calls, which are
+// mostly mapped to set_dummy (-1) in the mega_ccm driver.
 static void py260_sccb_configure(sensor_t *sensor) {
+    uint8_t slv = sensor->slv_addr;
     Serial.printf("Sensor PID: 0x%04X\n", sensor->id.PID);
 
-    // Reset with 100ms hold + 1500ms settle (matches M5Stack reference)
-    SCCB_Write16(sensor->slv_addr, 0x0102, 0x00);
+    // ---- Reset with 100ms hold + 1500ms settle (M5Stack reference) ----
+    SCCB_Write16(slv, PY260_RESET_REG, 0x00);
     delay(100);
-    SCCB_Write16(sensor->slv_addr, 0x0102, 0x01);
+    SCCB_Write16(slv, PY260_RESET_REG, 0x01);
     delay(1500);
 
-    // PY260 register map: 0x0120=pixel_fmt, 0x0121=resolution, 0x012A=quality
-    SCCB_Write16(sensor->slv_addr, 0x0120, 0x01);  // JPEG
+    Serial.println("PY260 SCCB configuration:");
+
+    // ---- Pixel format ----
+    py260_write(slv, PY260_PIXEL_FMT, 0x01, "Pixel fmt (JPEG)");
     delay(100);
 
-    // Resolution values: 0x01=QVGA, 0x02=VGA, 0x03=HD, 0x04=FHD
+    // ---- Resolution ----
     uint8_t res_reg;
     switch (CAMERA_FRAME_SIZE) {
         case FRAMESIZE_QVGA: res_reg = 0x01; break;
         case FRAMESIZE_VGA:  res_reg = 0x02; break;
         case FRAMESIZE_HD:   res_reg = 0x03; break;
-        case FRAMESIZE_FHD:  res_reg = 0x04; break;
-        default:             res_reg = 0x02; break;  // Default VGA
+        case FRAMESIZE_FHD:  res_reg = 0x05; break;
+        default:             res_reg = 0x02; break;
     }
-    SCCB_Write16(sensor->slv_addr, 0x0121, res_reg);
+    py260_write(slv, PY260_RESOLUTION, res_reg, "Resolution");
     delay(100);
 
-    // Quality: 0=high, 1=default, 2=low
-    SCCB_Write16(sensor->slv_addr, 0x012A, 0x00);  // High quality
-    delay(100);
+    // ---- System clock (from mega_ccm set_framesize — may not be needed
+    //       if the sensor's post-reset defaults are correct) ----
+    // py260_write(slv, PY260_SYS_CLK_DIV, 0x02, "Sys clock div");
+    // py260_write(slv, PY260_SYS_PLL_DIV, 0x01, "Sys PLL div");
 
-    Serial.println("PY260 configured via SCCB");
-}
+    // ---- Image quality ----
+    py260_write(slv, PY260_QUALITY, 0x00, "Quality (high)");
 
-// Re-enable ISP features after manual reset — without this the sensor's
-// image processing pipeline may be left unconfigured, causing red cast and
-// excessive noise in low-light scenes.
-static void configure_isp(sensor_t *s) {
-    Serial.println("Configuring ISP features:");
-
-    // White balance
-    apply_sensor_setting(s, "AWB",            s->set_whitebal,      1);
-    apply_sensor_setting(s, "AWB gain",       s->set_awb_gain,      1);
-    apply_sensor_setting(s, "WB mode (auto)", s->set_wb_mode,       0);
-
-    // Exposure & gain
-    apply_sensor_setting(s, "Auto exposure",  s->set_exposure_ctrl, 1);
-    apply_sensor_setting(s, "AEC2 (DSP)",     s->set_aec2,         1);
-    apply_sensor_setting(s, "Auto gain",      s->set_gain_ctrl,     1);
-
-    // set_gainceiling has a different signature (gainceiling_t enum) — call directly
-    if (s->set_gainceiling) {
-        int rc = s->set_gainceiling(s, static_cast<gainceiling_t>(2));
-        Serial.printf("  %-18s %s (value=%d)\n", "Gain ceiling",
-                      rc == 0 ? "OK" : "FAILED", 2);
-    } else {
-        Serial.printf("  %-18s SKIPPED (not implemented)\n", "Gain ceiling");
-    }
-
-    // Pixel / lens correction
-    apply_sensor_setting(s, "BPC",            s->set_bpc,           1);
-    apply_sensor_setting(s, "WPC",            s->set_wpc,           1);
-    apply_sensor_setting(s, "Gamma",          s->set_raw_gma,       1);
-    apply_sensor_setting(s, "Lens correction",s->set_lenc,          1);
-
-    // Noise reduction
-    apply_sensor_setting(s, "Denoise",        s->set_denoise,       0);
+    // ---- ISP / colour pipeline ----
+    py260_write(slv, PY260_AWB_MODE,   0x00, "AWB mode (auto)");
+    py260_write(slv, PY260_AGC_MODE,   0x00, "AGC mode (auto)");
 }
 
 static void setup_camera() {
@@ -337,7 +324,6 @@ static void setup_camera() {
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor) {
         py260_sccb_configure(sensor);
-        configure_isp(sensor);
     }
 
     // Wait for sensor to stabilize
