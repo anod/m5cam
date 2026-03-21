@@ -287,6 +287,21 @@ void setup() {
         delay(100);
 
         Serial.println("PY260 configured via SCCB");
+
+        // Re-enable auto white balance and exposure after manual reset —
+        // without this the sensor's AWB/AEC may be left in a default state,
+        // causing a strong red cast in low-light / indoor scenes.
+        if (sensor->set_whitebal)
+            sensor->set_whitebal(sensor, 1);     // enable AWB
+        if (sensor->set_awb_gain)
+            sensor->set_awb_gain(sensor, 1);     // enable AWB gain adjustment
+        if (sensor->set_wb_mode)
+            sensor->set_wb_mode(sensor, 0);      // 0 = Auto
+        if (sensor->set_exposure_ctrl)
+            sensor->set_exposure_ctrl(sensor, 1); // enable auto exposure
+        if (sensor->set_gain_ctrl)
+            sensor->set_gain_ctrl(sensor, 1);     // enable auto gain
+        Serial.println("AWB/AEC/AGC enabled");
     }
 
     // Wait for sensor to stabilize
