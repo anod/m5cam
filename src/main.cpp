@@ -19,6 +19,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <lwip/sockets.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "esp_task_wdt.h"
@@ -66,10 +67,10 @@ extern "C" {
 
 // ---- MJPEG stream boundary ----
 #define PART_BOUNDARY "frame"
-static const char *const STREAM_CONTENT_TYPE =
+static constexpr const char *STREAM_CONTENT_TYPE =
     "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char *const STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char *const STREAM_PART =
+static constexpr const char *STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static constexpr const char *STREAM_PART =
     "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 // ---- LED helpers ----
@@ -80,6 +81,13 @@ static void led_off() { digitalWrite(LED_GPIO_NUM, LOW); }
 static unsigned long last_wifi_check = 0;
 static unsigned long last_health_check = 0;
 static int camera_fail_count = 0;
+
+// ---- TCP_NODELAY on HTTP server sockets (reduces MJPEG latency) ----
+static esp_err_t httpd_open_fn(httpd_handle_t hd, int sockfd) {
+    int nodelay = 1;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    return ESP_OK;
+}
 
 static void wifi_reconnect() {
     if (WiFi.status() == WL_CONNECTED) return;
@@ -368,6 +376,9 @@ static void setup_http_server() {
     httpd_config.server_port      = HTTP_PORT;
     httpd_config.max_uri_handlers = 8;
     httpd_config.stack_size       = 16384;
+    httpd_config.core_id          = 0;     // pin to core 0 (camera DMA uses core 1)
+    httpd_config.lru_purge_enable = true;  // reclaim stale connections
+    httpd_config.open_fn          = httpd_open_fn;  // TCP_NODELAY per socket
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &httpd_config) == ESP_OK) {
@@ -481,20 +492,18 @@ void loop() {
 //  Handler: /  (Web UI)
 // ============================================================
 static esp_err_t index_handler(httpd_req_t *req) {
-    // Render the template into a heap buffer (PSRAM-backed when available)
-    // to avoid consuming 25% of the HTTP task's 16KB stack.
     char ip[16];
     WiFi.localIP().toString().toCharArray(ip, sizeof(ip));
-    size_t needed = strlen_P(INDEX_HTML) + 128;  // template + IP substitutions
+    size_t needed = strlen_P(INDEX_HTML) + 128;
     char *html = static_cast<char *>(malloc(needed));
     if (!html) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_send(req, "Out of memory", HTTPD_RESP_USE_STRLEN);
     }
-    snprintf(html, needed, INDEX_HTML, ip, ip);
+    int len = snprintf(html, needed, INDEX_HTML, ip, ip);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    esp_err_t res = httpd_resp_send(req, html, strlen(html));
+    esp_err_t res = httpd_resp_send(req, html, len);
     free(html);
     return res;
 }
@@ -541,6 +550,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
     int64_t last_frame = esp_timer_get_time();
     int frame_failures = 0;
+    int frame_count = 0;
 
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -580,14 +590,16 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         esp_camera_fb_return(fb);
         if (res != ESP_OK) break;
 
-        // Frame timing stats
+        // Frame timing stats (log every 30 frames to reduce overhead)
         int64_t now = esp_timer_get_time();
         int64_t frame_time = (now - last_frame) / 1000;
         last_frame = now;
-        Serial.printf("MJPG: %4luKB %3lums (%.1f fps)\r",
-                      (unsigned long)(frame_len / 1024),
-                      (unsigned long)frame_time,
-                      frame_time > 0 ? 1000.0 / frame_time : 0.0);
+        if (++frame_count % 30 == 0) {
+            Serial.printf("MJPG: %4luKB %3lums (%.1f fps)\r",
+                          (unsigned long)(frame_len / 1024),
+                          (unsigned long)frame_time,
+                          frame_time > 0 ? 1000.0 / frame_time : 0.0);
+        }
     }
 
     led_off();
