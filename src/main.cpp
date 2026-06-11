@@ -258,6 +258,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 #if PY260_AGC_MODE_SETTING < 0 || PY260_AGC_MODE_SETTING > 1
 #error "PY260_AGC_MODE_SETTING must be 0..1"
 #endif
+#if PY260_SATURATION_SETTING < 0 || PY260_SATURATION_SETTING > 6
+#error "PY260_SATURATION_SETTING must be 0..6"
+#endif
 
 // Helper: write a PY260 register and log success/failure.
 static void py260_write(uint8_t slv, uint16_t reg, uint8_t val,
@@ -314,6 +317,10 @@ static void py260_sccb_configure(sensor_t *sensor) {
                 "AWB mode");
     py260_write(slv, PY260_AGC_MODE, static_cast<uint8_t>(PY260_AGC_MODE_SETTING),
                 "AGC mode");
+    // Lowering saturation mutes the red/magenta IR chroma wash the filter-less
+    // PY260 produces in low light (no IR-cut filter on the CamS3 module).
+    py260_write(slv, PY260_SATURATION, static_cast<uint8_t>(PY260_SATURATION_SETTING),
+                "Saturation");
 }
 
 static void setup_camera() {

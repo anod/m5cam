@@ -80,6 +80,7 @@ Settings can be overridden via `.env` (see `.env.sample`) or edited directly in 
 | `CAMERA_FRAME_SIZE`   | `FRAMESIZE_VGA`  | Resolution (VGA=640×480)           |
 | `CAMERA_JPEG_QUALITY` | `12`             | JPEG quality (0–63, lower=better)  |
 | `CAMERA_FB_COUNT`     | `2`              | Frame buffer count                 |
+| `PY260_WB_MODE_SETTING` | `0`            | White balance: auto; use `1` sunny, `2` cloudy, `3` office, `4` home for fixed presets |
 
 Available resolutions: `FRAMESIZE_QVGA` (320×240), `FRAMESIZE_VGA` (640×480), `FRAMESIZE_SVGA` (800×600), `FRAMESIZE_XGA` (1024×768), `FRAMESIZE_HD` (1280×720), `FRAMESIZE_SXGA` (1280×1024), `FRAMESIZE_UXGA` (1600×1200), `FRAMESIZE_QXGA` (2048×1536), `FRAMESIZE_QSXGA` (2592×1944). Higher resolutions reduce frame rate; VGA is recommended for smooth streaming.
 

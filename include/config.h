@@ -43,10 +43,16 @@
 // PY260 ISP settings
 // White balance: 0=auto, 1=sunny, 2=cloudy, 3=office, 4=home
 #ifndef PY260_WB_MODE_SETTING
-#define PY260_WB_MODE_SETTING 3             // Office/fluorescent preset; home over-corrects blue at night
+#define PY260_WB_MODE_SETTING 0             // Auto balance handles mixed/day/night lighting best
 #endif
 #ifndef PY260_AGC_MODE_SETTING
 #define PY260_AGC_MODE_SETTING 0            // 0=auto, 1=manual
+#endif
+
+// Saturation: 0 (grayscale) .. 6 (most colour). Filter-less PY260 floods the
+// red channel with IR at night; a low value mutes that red wash to neutral.
+#ifndef PY260_SATURATION_SETTING
+#define PY260_SATURATION_SETTING 0
 #endif
 
 // Web server port
