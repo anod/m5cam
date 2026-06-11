@@ -7,6 +7,7 @@
  *   /stream   — MJPEG stream (for Home Assistant)
  *   /status   — JSON device status
  *   /restart  — Reboot the device
+ *   OTA        — ArduinoOTA network firmware updates
  *
  * Home Assistant configuration.yaml:
  *   camera:
@@ -19,6 +20,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include <lwip/sockets.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
@@ -43,6 +45,9 @@
 #ifndef STREAM_MAX_FRAME_FAILURES
 #define STREAM_MAX_FRAME_FAILURES  3       // transient failures before ending stream
 #endif
+#ifndef STREAM_STATS_INTERVAL
+#define STREAM_STATS_INTERVAL      30      // log every N streamed frames
+#endif
 
 // ---- Forward declarations: HTTP handlers ----
 static esp_err_t index_handler(httpd_req_t *req);
@@ -54,6 +59,7 @@ static esp_err_t restart_handler(httpd_req_t *req);
 // ---- Forward declarations: setup helpers ----
 static void setup_camera();
 static void setup_wifi();
+static void setup_ota();
 static void setup_http_server();
 
 // SCCB (I2C) register access — from pre-compiled esp32-camera library.
@@ -81,6 +87,25 @@ static void led_off() { digitalWrite(LED_GPIO_NUM, LOW); }
 static unsigned long last_wifi_check = 0;
 static unsigned long last_health_check = 0;
 static int camera_fail_count = 0;
+static volatile bool ota_in_progress = false;
+static int active_streams = 0;
+static portMUX_TYPE active_streams_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void active_streams_add(int delta) {
+    portENTER_CRITICAL(&active_streams_lock);
+    active_streams += delta;
+    if (active_streams < 0) {
+        active_streams = 0;
+    }
+    portEXIT_CRITICAL(&active_streams_lock);
+}
+
+static int active_streams_get() {
+    portENTER_CRITICAL(&active_streams_lock);
+    int streams = active_streams;
+    portEXIT_CRITICAL(&active_streams_lock);
+    return streams;
+}
 
 // ---- TCP_NODELAY on HTTP server sockets (reduces MJPEG latency) ----
 static esp_err_t httpd_open_fn(httpd_handle_t hd, int sockfd) {
@@ -227,6 +252,13 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 #define PY260_SYS_CLK_DIV     0x0200
 #define PY260_SYS_PLL_DIV     0x0201
 
+#if PY260_WB_MODE_SETTING < 0 || PY260_WB_MODE_SETTING > 4
+#error "PY260_WB_MODE_SETTING must be 0..4"
+#endif
+#if PY260_AGC_MODE_SETTING < 0 || PY260_AGC_MODE_SETTING > 1
+#error "PY260_AGC_MODE_SETTING must be 0..1"
+#endif
+
 // Helper: write a PY260 register and log success/failure.
 static void py260_write(uint8_t slv, uint16_t reg, uint8_t val,
                         const char *label) {
@@ -278,8 +310,10 @@ static void py260_sccb_configure(sensor_t *sensor) {
     py260_write(slv, PY260_QUALITY, 0x00, "Quality (high)");
 
     // ---- ISP / colour pipeline ----
-    py260_write(slv, PY260_AWB_MODE,   0x00, "AWB mode (auto)");
-    py260_write(slv, PY260_AGC_MODE,   0x00, "AGC mode (auto)");
+    py260_write(slv, PY260_AWB_MODE, static_cast<uint8_t>(PY260_WB_MODE_SETTING),
+                "AWB mode");
+    py260_write(slv, PY260_AGC_MODE, static_cast<uint8_t>(PY260_AGC_MODE_SETTING),
+                "AGC mode");
 }
 
 static void setup_camera() {
@@ -369,6 +403,49 @@ static void setup_wifi() {
 }
 
 // ============================================================
+//  OTA firmware updates
+// ============================================================
+static void setup_ota() {
+    ArduinoOTA.setHostname(MDNS_HOSTNAME);
+    ArduinoOTA.setPort(OTA_PORT);
+    if (strlen(OTA_PASSWORD_HASH) > 0) {
+        ArduinoOTA.setPasswordHash(OTA_PASSWORD_HASH);
+    }
+
+    ArduinoOTA
+        .onStart([]() {
+            ota_in_progress = true;
+            led_on();
+            Serial.printf("OTA update starting: %s\n",
+                          ArduinoOTA.getCommand() == U_FLASH ? "firmware" : "filesystem");
+        })
+        .onEnd([]() {
+            Serial.println("\nOTA update complete");
+            led_off();
+            ota_in_progress = false;
+        })
+        .onProgress([](unsigned int progress, unsigned int total) {
+            Serial.printf("OTA progress: %u%%\r", (progress * 100) / total);
+        })
+        .onError([](ota_error_t error) {
+            led_off();
+            ota_in_progress = false;
+            Serial.printf("OTA error[%u]: ", error);
+            if (error == OTA_AUTH_ERROR) Serial.println("auth failed");
+            else if (error == OTA_BEGIN_ERROR) Serial.println("begin failed");
+            else if (error == OTA_CONNECT_ERROR) Serial.println("connect failed");
+            else if (error == OTA_RECEIVE_ERROR) Serial.println("receive failed");
+            else if (error == OTA_END_ERROR) Serial.println("end failed");
+            else Serial.println("unknown");
+        });
+
+    ArduinoOTA.begin();
+    Serial.printf("OTA ready on %s.local:%d%s\n",
+                  MDNS_HOSTNAME, OTA_PORT,
+                  strlen(OTA_PASSWORD_HASH) > 0 ? " (password protected)" : "");
+}
+
+// ============================================================
 //  HTTP Server
 // ============================================================
 static void setup_http_server() {
@@ -429,6 +506,7 @@ void setup() {
 
     setup_camera();
     setup_wifi();
+    setup_ota();
     setup_http_server();
 
     // Ready — brief LED flash
@@ -450,6 +528,7 @@ void setup() {
     WiFi.localIP().toString().toCharArray(boot_ip, sizeof(boot_ip));
     Serial.printf("  http://%s\n", boot_ip);
     Serial.printf("  http://%s.local\n", MDNS_HOSTNAME);
+    Serial.printf("  OTA: %s.local:%d\n", MDNS_HOSTNAME, OTA_PORT);
     Serial.println("========================================");
 }
 
@@ -458,6 +537,7 @@ void setup() {
 // ============================================================
 void loop() {
     esp_task_wdt_reset();
+    ArduinoOTA.handle();
     unsigned long now = millis();
 
     // WiFi reconnection
@@ -467,7 +547,8 @@ void loop() {
     }
 
     // Camera health: grab a test frame to detect sensor hangs
-    if (now - last_health_check >= CAMERA_HEALTH_INTERVAL_MS) {
+    if (!ota_in_progress && active_streams_get() == 0 &&
+        now - last_health_check >= CAMERA_HEALTH_INTERVAL_MS) {
         last_health_check = now;
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
@@ -485,7 +566,7 @@ void loop() {
         }
     }
 
-    delay(1000);
+    delay(10);
 }
 
 // ============================================================
@@ -546,6 +627,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
 
     led_on();
+    active_streams_add(1);
     Serial.println("Stream started");
 
     int64_t last_frame = esp_timer_get_time();
@@ -567,17 +649,10 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         }
         frame_failures = 0;
 
-        // Send MJPEG boundary
-        res = httpd_resp_send_chunk(req, STREAM_BOUNDARY,
-                                    strlen(STREAM_BOUNDARY));
-        if (res != ESP_OK) {
-            esp_camera_fb_return(fb);
-            break;
-        }
-
-        // Send part header with content length
+        // Send boundary and part header together to reduce per-frame TCP writes.
         size_t hlen = snprintf(part_buf, sizeof(part_buf),
-                               STREAM_PART, fb->len);
+                               "%sContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                               STREAM_BOUNDARY, fb->len);
         res = httpd_resp_send_chunk(req, part_buf, hlen);
         if (res != ESP_OK) {
             esp_camera_fb_return(fb);
@@ -594,7 +669,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         int64_t now = esp_timer_get_time();
         int64_t frame_time = (now - last_frame) / 1000;
         last_frame = now;
-        if (++frame_count % 30 == 0) {
+        if (++frame_count % STREAM_STATS_INTERVAL == 0) {
             Serial.printf("MJPG: %4luKB %3lums (%.1f fps)\r",
                           (unsigned long)(frame_len / 1024),
                           (unsigned long)frame_time,
@@ -602,6 +677,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         }
     }
 
+    active_streams_add(-1);
     led_off();
     Serial.println("Stream ended");
     return res;
@@ -611,7 +687,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 //  Handler: /status  (JSON device info)
 // ============================================================
 static esp_err_t status_handler(httpd_req_t *req) {
-    char json[768];
+    char json[1024];
     sensor_t *s = esp_camera_sensor_get();
     char ip[16];
     WiFi.localIP().toString().toCharArray(ip, sizeof(ip));
@@ -629,6 +705,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
         "\"free_heap\":%u,"
         "\"psram_size\":%u,"
         "\"free_psram\":%u,"
+        "\"ota_port\":%d,"
+        "\"ota_in_progress\":%s,"
         "\"framesize\":%d,"
         "\"quality\":%d,"
         "\"stream_url\":\"http://%s/stream\","
@@ -644,6 +722,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
         ESP.getFreeHeap(),
         ESP.getPsramSize(),
         ESP.getFreePsram(),
+        OTA_PORT,
+        ota_in_progress ? "true" : "false",
         s ? s->status.framesize : -1,
         s ? s->status.quality : -1,
         ip,
